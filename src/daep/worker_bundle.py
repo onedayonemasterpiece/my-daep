@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
+
 from .config import Settings
 
 
 def render_worker_bundle(settings: Settings) -> str:
     """Return a self-contained stdlib worker executed inside a private Kaggle notebook."""
-    return f'''import base64, json, os, pathlib, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
+    auth_json = json.dumps(settings.opencode_auth or {}, separators=(",", ":"))
+    worker_env_json = json.dumps(settings.extra_worker_env, separators=(",", ":"))
+    return f'''import json, os, pathlib, subprocess, tempfile, threading, time, urllib.parse, urllib.request, uuid
 SUP=os.environ["DAEP_SUPERVISOR_URL"].rstrip("/")
 ATT=os.environ["DAEP_ATTEMPT_ID"]
 TOK=os.environ["DAEP_ATTEMPT_TOKEN"]
@@ -15,46 +19,63 @@ CHECKPOINT={int(settings.checkpoint_seconds)}
 STOP=threading.Event()
 SEQ=0
 BOOT=None
+OPENCODE_AUTH=json.loads({auth_json!r})
+EXTRA_ENV=json.loads({worker_env_json!r})
+
 
 def api(method, path, body=None):
     data=None if body is None else json.dumps(body).encode()
-    req=urllib.request.Request(SUP+path, data=data, method=method, headers={{"Authorization":"Bearer "+TOK,"Content-Type":"application/json"}})
-    with urllib.request.urlopen(req, timeout=40) as r:
+    req=urllib.request.Request(SUP+path,data=data,method=method,headers={{"Authorization":"Bearer "+TOK,"Content-Type":"application/json"}})
+    with urllib.request.urlopen(req,timeout=40) as r:
         raw=r.read()
         return json.loads(raw.decode()) if raw else {{}}
 
-def run(args, cwd=None, check=True):
-    p=subprocess.run(args,cwd=cwd,text=True,capture_output=True)
+
+def run(args,cwd=None,check=True,env=None):
+    p=subprocess.run(args,cwd=cwd,text=True,capture_output=True,env=env)
     if check and p.returncode:
         raise RuntimeError((p.stderr or p.stdout)[-4000:])
     return p
 
-def token():
+
+def gh_token():
     q=urllib.parse.urlencode({{"worker_id":WID}})
     return api("GET",f"/v1/worker/{{ATT}}/github-token?{{q}}")
 
+
 def git(args,cwd,check=True):
-    t=token()["token"]
-    auth=base64.b64encode(("x-access-token:"+t).encode()).decode()
-    return run(["git","-c",f"http.extraHeader=Authorization: Basic {{auth}}",*args],cwd=cwd,check=check)
+    token=gh_token()["token"]
+    with tempfile.TemporaryDirectory(prefix="daep-askpass-") as td:
+        script=pathlib.Path(td)/"askpass.sh"
+        script.write_text("#!/bin/sh\\ncase \\"$1\\" in\\n*Username*) printf '%s\\n' \\"$DAEP_GIT_USERNAME\\" ;;;\\n*) printf '%s\\n' \\"$DAEP_GIT_PASSWORD\\" ;;;\\nesac\\n".replace(";;;",";;"))
+        script.chmod(0o700)
+        env=os.environ.copy()
+        env.update({{"GIT_ASKPASS":str(script),"GIT_TERMINAL_PROMPT":"0","DAEP_GIT_USERNAME":"x-access-token","DAEP_GIT_PASSWORD":token}})
+        return run(["git",*args],cwd=cwd,check=check,env=env)
+
 
 def emit(kind,payload=None,significant=False):
     global SEQ
     SEQ+=1
     api("POST",f"/v1/worker/{{ATT}}/event",{{"worker_id":WID,"event_key":f"{{ATT}}:{{kind}}:{{SEQ}}","seq":SEQ,"kind":kind,"significant":significant,"payload":payload or {{}}}})
 
-def checkpoint(repo, reason):
+
+def checkpoint(repo,reason):
     global SEQ
-    p=run(["git","status","--porcelain"],cwd=repo,check=True)
-    if p.stdout.strip():
+    dirty=run(["git","status","--porcelain"],cwd=repo).stdout.strip()
+    if dirty:
         run(["git","add","-A"],cwd=repo)
         run(["git","-c","user.name=DAEP Worker","-c","user.email=daep-worker@local","commit","-m",f"daep checkpoint: {{reason}}"],cwd=repo)
     sha=run(["git","rev-parse","HEAD"],cwd=repo).stdout.strip()
     git(["push","origin",f"HEAD:refs/heads/{{BOOT['branch']}}"],repo)
-    read=git(["ls-remote","origin",f"refs/heads/{{BOOT['branch']}}"],repo).stdout.split()[0]
+    ref=git(["ls-remote","origin",f"refs/heads/{{BOOT['branch']}}"],repo).stdout.strip()
+    readback=ref.split()[0] if ref else ""
+    if readback!=sha:
+        raise RuntimeError("remote checkpoint readback mismatch")
     SEQ+=1
-    api("POST",f"/v1/worker/{{ATT}}/checkpoint",{{"worker_id":WID,"seq":SEQ,"sha":sha,"branch":BOOT["branch"],"readback_sha":read}})
+    api("POST",f"/v1/worker/{{ATT}}/checkpoint",{{"worker_id":WID,"seq":SEQ,"sha":sha,"branch":BOOT["branch"],"readback_sha":readback}})
     return sha
+
 
 def heartbeat_loop(repo):
     while not STOP.wait(HEARTBEAT):
@@ -68,12 +89,27 @@ def heartbeat_loop(repo):
         except Exception:
             pass
 
+
 def checkpoint_loop(repo):
     while not STOP.wait(CHECKPOINT):
-        try: checkpoint(repo,"periodic")
+        try:
+            checkpoint(repo,"periodic")
         except Exception as e:
             try: emit("checkpoint_failed",{{"error":str(e)}},True)
             except Exception: pass
+
+
+def configure_opencode():
+    for k,v in EXTRA_ENV.items():
+        os.environ[k]=v
+    if OPENCODE_AUTH:
+        auth_path=pathlib.Path.home()/".local"/"share"/"opencode"/"auth.json"
+        auth_path.parent.mkdir(parents=True,exist_ok=True)
+        auth_path.write_text(json.dumps(OPENCODE_AUTH),encoding="utf-8")
+        auth_path.chmod(0o600)
+    if {bool(settings.opencode_install)!r}:
+        run(["npm","install","-g",{settings.opencode_package!r}],check=True)
+
 
 def main():
     global BOOT
@@ -84,16 +120,15 @@ def main():
     if repo.exists():
         run(["rm","-rf",str(repo)])
     repo.mkdir()
-    git(["init"],repo)
-    git(["remote","add","origin",f"https://github.com/{{BOOT['repository']}}.git"],repo)
+    run(["git","init"],cwd=repo)
+    run(["git","remote","add","origin",f"https://github.com/{{BOOT['repository']}}.git"],cwd=repo)
     git(["fetch","--depth=80","origin",BOOT["base_sha"]],repo)
     run(["git","checkout","-B",BOOT["branch"],BOOT["base_sha"]],cwd=repo)
+    configure_opencode()
     emit("worker_ready",{{"base_sha":BOOT["base_sha"],"branch":BOOT["branch"],"model":BOOT["model"]}},True)
     threading.Thread(target=heartbeat_loop,args=(repo,),daemon=True).start()
     threading.Thread(target=checkpoint_loop,args=(repo,),daemon=True).start()
     try:
-        if {bool(settings.opencode_install)!r}:
-            run(["npm","install","-g",{settings.opencode_package!r}],check=True)
         cmd=["opencode","run","--model",BOOT["model"],BOOT["instruction"]]
         emit("opencode_started",{{"command":["opencode","run","--model",BOOT["model"],"<instruction>"]}},True)
         p=subprocess.Popen(cmd,cwd=repo,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
@@ -101,11 +136,12 @@ def main():
         while p.poll() is None and not STOP.wait(2):
             if p.stdout:
                 line=p.stdout.readline()
-                if line: tail=(tail+[line[-1000:]])[-40:]
+                if line:
+                    tail=(tail+[line[-1000:]])[-40:]
         if STOP.is_set() and p.poll() is None:
             p.terminate()
-            try:p.wait(15)
-            except subprocess.TimeoutExpired:p.kill()
+            try: p.wait(15)
+            except subprocess.TimeoutExpired: p.kill()
             sha=checkpoint(repo,"stop")
             api("POST",f"/v1/worker/{{ATT}}/stopped",{{"worker_id":WID,"seq":SEQ,"payload":{{"cancelled":True,"reason":"stop command","checkpoint_sha":sha}}}})
             return
@@ -128,7 +164,8 @@ def main():
             sha=checkpoint(repo,"exception") if repo.exists() else None
             emit("worker_exception",{{"error":str(e),"checkpoint_sha":sha}},True)
             api("POST",f"/v1/worker/{{ATT}}/stopped",{{"worker_id":WID,"seq":SEQ,"payload":{{"cancelled":False,"reason":str(e)}}}})
-        except Exception: pass
+        except Exception:
+            pass
         raise
     finally:
         STOP.set()
