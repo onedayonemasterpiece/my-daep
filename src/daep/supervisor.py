@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import subprocess
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -75,8 +75,6 @@ class CommandAckBody(BaseModel):
 class FinalizeBody(BaseModel):
     result_sha: str
     checks: list[dict[str, Any]]
-    pr_number: int | None = None
-    pr_url: str | None = None
 
 
 class AttachBody(BaseModel):
@@ -132,13 +130,14 @@ class Runtime:
             try:
                 self.tick()
             except Exception:
-                # Per-job failures are persisted below; an unexpected scheduler error must not kill the controller.
+                # A new/unclassified scheduler error must not terminate lifecycle management.
                 continue
 
     def tick(self) -> dict[str, Any]:
         launched: list[str] = []
         stale: list[str] = []
         reconciled: list[str] = []
+        uncertain_launches: list[str] = []
         if self.kaggle:
             for row in self.store.launch_intents(time.time() - max(30, self.settings.callback_grace_seconds)):
                 state = self.kaggle.status(str(row["provider_ref"]))
@@ -163,6 +162,10 @@ class Runtime:
                     )
                     self.store.mark_launch_success(attempt.id, result)
                     launched.append(attempt.id)
+                except subprocess.TimeoutExpired:
+                    # Lost launch acknowledgement is uncertain, not a proven failure. Keep the
+                    # persisted launch intent fenced and reconcile provider identity next ticks.
+                    uncertain_launches.append(attempt.id)
                 except Exception as exc:
                     self.store.mark_launch_error(attempt.id, str(exc), retryable=True)
         deliveries: dict[str, Any] = {}
@@ -170,7 +173,42 @@ class Runtime:
             deliveries[job_id] = self.coordinator.deliver_pending(job_id)
         if self.settings.backup_dir:
             self.store.backup_to(self.settings.backup_dir)
-        return {"launched": launched, "stale": stale, "reconciled": reconciled, "deliveries": deliveries}
+        return {
+            "launched": launched,
+            "uncertain_launches": uncertain_launches,
+            "stale": stale,
+            "reconciled": reconciled,
+            "deliveries": deliveries,
+        }
+
+    def finalize(self, job_id: str, *, result_sha: str, checks: list[dict[str, Any]]) -> dict[str, Any]:
+        snapshot = self.store.get_job(job_id)
+        job = snapshot["job"]
+        if not self.github:
+            raise RuntimeError("GitHub App is required to verify result branch and ensure the final PR")
+        remote_sha = self.github.remote_ref_sha(str(job["repository"]), str(job["integration_branch"]))
+        if remote_sha != result_sha:
+            raise ValueError(
+                f"integration branch readback mismatch: expected {result_sha}, got {remote_sha or 'missing'}"
+            )
+        pr = self.github.ensure_pull_request(
+            repository=str(job["repository"]),
+            head_branch=str(job["integration_branch"]),
+            base_branch=str(job["base_branch"]),
+            title=f"DAEP distributed result {job_id}",
+            body=(
+                f"DAEP job `{job_id}` integrated exact worker checkpoints onto `{result_sha}`. "
+                "Completion is recorded only with the supplied project check results."
+            ),
+        )
+        self.store.finalize_job(
+            job_id,
+            result_sha=result_sha,
+            checks=checks,
+            pr_number=int(pr["number"]),
+            pr_url=str(pr["url"]),
+        )
+        return self.store.get_job(job_id)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -254,8 +292,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/jobs/{job_id}/finalize")
     def finalize(job_id: str, body: FinalizeBody, authorization: str | None = Header(default=None)) -> dict[str, Any]:
         control(authorization)
-        runtime.store.finalize_job(job_id, result_sha=body.result_sha, checks=body.checks, pr_number=body.pr_number, pr_url=body.pr_url)
-        return runtime.store.get_job(job_id)
+        try:
+            return runtime.finalize(job_id, result_sha=body.result_sha, checks=body.checks)
+        except KeyError:
+            raise HTTPException(404, "job not found")
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc))
 
     @app.get("/v1/jobs/{job_id}/export")
     def export(job_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
@@ -347,7 +389,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/worker/{attempt_id}/stopped")
     def stopped(attempt_id: str, body: WorkerBody, authorization: str | None = Header(default=None)) -> dict[str, Any]:
         worker(attempt_id, authorization)
-        runtime.store.worker_stopped(attempt_id, body.worker_id, cancelled=bool(body.payload.get("cancelled")), reason=str(body.payload.get("reason") or "stopped"))
+        runtime.store.worker_stopped(
+            attempt_id,
+            body.worker_id,
+            cancelled=bool(body.payload.get("cancelled")),
+            reason=str(body.payload.get("reason") or "stopped"),
+        )
         return {"ok": True}
 
     return app
