@@ -51,15 +51,25 @@ const taskSpec = schema.object({
   max_attempts: schema.number().int().min(1).max(8).default(3),
 })
 
+const checkSpec = schema.object({
+  name: schema.string().min(1),
+  command: schema.string().min(1),
+  outcome: schema.string().min(1),
+  detail: schema.string().optional(),
+  metadata: schema.record(schema.string(), schema.any()).optional(),
+})
+
 export default tool({
   description: "Run and control explicit DAEP distributed coding jobs on Kaggle for the current GitHub worktree. Use submit only when the user explicitly requests distributed/DAEP execution; do not silently replace distributed execution with local coding.",
   args: {
-    action: schema.enum(["submit", "status", "follow", "attach", "cancel", "export"]),
+    action: schema.enum(["submit", "status", "follow", "resume", "attach", "cancel", "export", "finalize"]),
     job_id: schema.string().optional(),
     max_workers: schema.number().int().min(1).max(4).optional(),
     idempotency_key: schema.string().optional(),
     tasks: schema.array(taskSpec).optional(),
     after: schema.number().int().min(0).optional(),
+    result_sha: schema.string().optional(),
+    checks: schema.array(checkSpec).optional(),
   },
   async execute(args, context) {
     if (args.action === "submit") {
@@ -91,7 +101,7 @@ export default tool({
     if (!args.job_id) throw new Error(`${args.action} requires job_id`)
     if (args.action === "status") return JSON.stringify(await api(`/v1/jobs/${args.job_id}`), null, 2)
     if (args.action === "follow") return JSON.stringify(await api(`/v1/jobs/${args.job_id}/events?after=${args.after || 0}`), null, 2)
-    if (args.action === "attach") {
+    if (args.action === "resume" || args.action === "attach") {
       return JSON.stringify(await api(`/v1/jobs/${args.job_id}/attach`, {
         method: "POST",
         body: JSON.stringify({ session_id: context.sessionID, server_url: process.env.DAEP_OPENCODE_SERVER_URL || null }),
@@ -99,6 +109,13 @@ export default tool({
     }
     if (args.action === "cancel") return JSON.stringify(await api(`/v1/jobs/${args.job_id}/cancel`, { method: "POST" }), null, 2)
     if (args.action === "export") return JSON.stringify(await api(`/v1/jobs/${args.job_id}/export`), null, 2)
+    if (args.action === "finalize") {
+      if (!args.result_sha || !args.checks?.length) throw new Error("finalize requires result_sha and at least one actual check result")
+      return JSON.stringify(await api(`/v1/jobs/${args.job_id}/finalize`, {
+        method: "POST",
+        body: JSON.stringify({ result_sha: args.result_sha, checks: args.checks }),
+      }), null, 2)
+    }
     throw new Error(`unsupported action: ${args.action}`)
   },
 })
