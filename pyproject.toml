@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "my-daep"
+version = "0.1.0"
+description = "Distributed Agent Execution Platform: OpenCode coordinator + Kaggle coding workers"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "PyJWT[crypto]>=2.10,<3",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.4,<9", "pytest-cov>=6,<7"]
+
+[project.scripts]
+daep = "daep.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/daep"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
