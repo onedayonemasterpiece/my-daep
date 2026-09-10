@@ -11,6 +11,7 @@ import httpx
 import uvicorn
 
 from .config import Settings
+from .opencode_tool import tool_source
 from .supervisor import create_app
 
 
@@ -32,10 +33,19 @@ def _print(value: Any) -> None:
     print(json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True))
 
 
+def _install_opencode_tool(target: str | None = None) -> Path:
+    path = Path(target).expanduser() if target else Path.home() / ".config" / "opencode" / "tools" / "daep.ts"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(tool_source(), encoding="utf-8")
+    return path
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="daep", description="my-daep distributed OpenCode/Kaggle controller")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("serve", help="run supervisor service")
+    install = sub.add_parser("install-opencode", help="install the global OpenCode daep tool")
+    install.add_argument("--target", help="override ~/.config/opencode/tools/daep.ts")
     s = sub.add_parser("submit", help="submit a durable distributed job from JSON")
     s.add_argument("spec", nargs="?", default="-")
     st = sub.add_parser("status")
@@ -56,13 +66,16 @@ def main(argv: list[str] | None = None) -> None:
     fin.add_argument("job_id")
     fin.add_argument("result_sha")
     fin.add_argument("checks", help="JSON file containing a list of actual check results")
-    tick = sub.add_parser("tick", help="run one scheduler/reconciliation iteration")
+    sub.add_parser("tick", help="run one scheduler/reconciliation iteration")
     args = p.parse_args(argv)
 
     if args.cmd == "serve":
         settings = Settings.from_env()
         settings.validate_runtime()
         uvicorn.run(create_app(settings), host=settings.bind_host, port=settings.bind_port)
+        return
+    if args.cmd == "install-opencode":
+        print(_install_opencode_tool(args.target))
         return
 
     client, _ = _client()
