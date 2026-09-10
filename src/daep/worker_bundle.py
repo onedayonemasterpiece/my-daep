@@ -67,11 +67,11 @@ def checkpoint(repo,reason):
         run(["git","add","-A"],cwd=repo)
         run(["git","-c","user.name=DAEP Worker","-c","user.email=daep-worker@local","commit","-m",f"daep checkpoint: {{reason}}"],cwd=repo)
     sha=run(["git","rev-parse","HEAD"],cwd=repo).stdout.strip()
-    git(["push","origin",f"HEAD:refs/heads/{{BOOT['branch']}}"],repo)
+    push=git(["push","origin",f"HEAD:refs/heads/{{BOOT['branch']}}"],repo,check=False)
     ref=git(["ls-remote","origin",f"refs/heads/{{BOOT['branch']}}"],repo).stdout.strip()
     readback=ref.split()[0] if ref else ""
     if readback!=sha:
-        raise RuntimeError("remote checkpoint readback mismatch")
+        raise RuntimeError(f"push not confirmed (push_rc={{push.returncode}}, readback={{readback or 'missing'}})")
     SEQ+=1
     api("POST",f"/v1/worker/{{ATT}}/checkpoint",{{"worker_id":WID,"seq":SEQ,"sha":sha,"branch":BOOT["branch"],"readback_sha":readback}})
     return sha
@@ -132,21 +132,18 @@ def main():
         cmd=["opencode","run","--model",BOOT["model"],BOOT["instruction"]]
         emit("opencode_started",{{"command":["opencode","run","--model",BOOT["model"],"<instruction>"]}},True)
         p=subprocess.Popen(cmd,cwd=repo,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-        tail=[]
         while p.poll() is None and not STOP.wait(2):
-            if p.stdout:
-                line=p.stdout.readline()
-                if line:
-                    tail=(tail+[line[-1000:]])[-40:]
+            pass
         if STOP.is_set() and p.poll() is None:
             p.terminate()
             try: p.wait(15)
             except subprocess.TimeoutExpired: p.kill()
+            output=(p.communicate()[0] or "")[-12000:]
             sha=checkpoint(repo,"stop")
-            api("POST",f"/v1/worker/{{ATT}}/stopped",{{"worker_id":WID,"seq":SEQ,"payload":{{"cancelled":True,"reason":"stop command","checkpoint_sha":sha}}}})
+            api("POST",f"/v1/worker/{{ATT}}/stopped",{{"worker_id":WID,"seq":SEQ,"payload":{{"cancelled":True,"reason":"stop command","checkpoint_sha":sha,"tail":output[-2000:]}}}})
             return
-        rc=p.wait()
-        output="".join(tail)
+        output=(p.communicate()[0] or "")[-12000:]
+        rc=p.returncode
         if rc!=0:
             sha=checkpoint(repo,"opencode-failure")
             low=output.lower()
