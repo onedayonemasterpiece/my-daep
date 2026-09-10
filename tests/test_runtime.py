@@ -6,8 +6,10 @@ from fastapi.testclient import TestClient
 
 from daep.config import Settings
 from daep.models import JobSpec, TaskSpec
+from daep.opencode_tool import tool_source
 from daep.store import Store
 from daep.supervisor import create_app
+from daep.worker_bundle import render_worker_bundle
 
 
 def spec(key: str = "k1", workers: int = 2) -> JobSpec:
@@ -42,8 +44,7 @@ def test_idempotent_submit_and_parallel_limit(tmp_path: Path):
 def test_failed_worker_recovers_from_checkpoint_without_losing_other_result(tmp_path: Path):
     store = Store(tmp_path / "state.db")
     snap, _ = store.submit_job(spec())
-    attempts = store.prepare_launches(global_limit=4, provider_ref_factory=provider)
-    a, b = attempts
+    a, b = store.prepare_launches(global_limit=4, provider_ref_factory=provider)
     store.mark_launch_success(a.id)
     store.mark_launch_success(b.id)
     store.register_worker(a.id, "wa", 120)
@@ -73,12 +74,7 @@ def test_max_four_is_enforced(tmp_path: Path):
 
 
 def test_api_auth_submit_status_export(tmp_path: Path):
-    settings = Settings(
-        db_path=tmp_path / "state.db",
-        control_token="control-secret",
-        worker_hmac_secret="w" * 32,
-        max_workers=4,
-    )
+    settings = Settings(db_path=tmp_path / "state.db", control_token="control-secret", worker_hmac_secret="w" * 32, max_workers=4)
     with TestClient(create_app(settings)) as client:
         assert client.get("/healthz").status_code == 200
         body = {
@@ -105,3 +101,19 @@ def test_attempt_token_is_bound_to_attempt(tmp_path: Path):
     signer = app.state.runtime.signer
     assert signer.verify("att_a", signer.token_for("att_a"))
     assert not signer.verify("att_b", signer.token_for("att_a"))
+
+
+def test_generated_worker_is_valid_python_and_uses_askpass():
+    source = render_worker_bundle(Settings(control_token="c", worker_hmac_secret="z" * 32))
+    compile(source, "<daep-worker>", "exec")
+    assert "GIT_ASKPASS" in source
+    assert "x-access-token@github.com" not in source
+    assert "push not confirmed" in source
+
+
+def test_global_opencode_tool_exposes_full_control_surface():
+    source = tool_source()
+    assert '"submit", "status", "follow", "resume", "attach", "cancel", "export", "finalize"' in source
+    assert "context.sessionID" in source
+    assert "worktree has uncommitted changes" in source
+    assert "/finalize" in source
